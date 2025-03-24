@@ -22,13 +22,37 @@ let useDbConnection = false;
 // Try to connect to database if packages are installed
 async function initDb() {
   try {
-    // Only try to import pg if it's available
-    const { Pool } = await import('pg');
+    // Import the pg module
+    const pg = await import('pg').catch(e => {
+      console.error('Failed to import pg module:', e.message);
+      return null;
+    });
     
-    // Create pool with environment variables (automatically uses PG* env vars)
-    const pool = new Pool();
+    if (!pg) {
+      throw new Error('pg module not available. Try running: npm install pg');
+    }
+    
+    // Log the structure of the pg module to understand its shape
+    console.log('pg module structure:', Object.keys(pg));
+    
+    // The Pool constructor might be in different locations depending on how the module is structured
+    let Pool;
+    if (pg.Pool) {
+      Pool = pg.Pool;
+    } else if (pg.default && pg.default.Pool) {
+      Pool = pg.default.Pool;
+    } else {
+      console.error('pg module content:', pg);
+      throw new Error('Could not locate Pool constructor in pg module. Make sure pg is installed: npm install pg');
+    }
+    
+    console.log('Creating PostgreSQL connection pool...');
+    const pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+    });
     
     // Test the connection
+    console.log('Testing database connection...');
     await pool.query('SELECT NOW()');
     console.log('Database connection successful');
     
@@ -37,7 +61,7 @@ async function initDb() {
     return pool;
   } catch (err) {
     console.log('Database connection failed or pg not installed. Using mock data instead.');
-    console.error(err.message);
+    console.error('Error details:', err);
     useDbConnection = false;
     return null;
   }
