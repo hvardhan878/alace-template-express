@@ -5,7 +5,6 @@ import express from 'express';
 import compression from 'compression';
 import sirv from 'sirv';
 import { createServer as createViteServer } from 'vite';
-import mockData from './src/config/mockData.js';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -15,54 +14,32 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isProduction = process.env.NODE_ENV === 'production';
 const port = process.env.PORT || 3000;
 
-// Initialize database if needed
+// Initialize database connection
 let db = null;
-let useDbConnection = false;
+let dbConnected = false;
 
-// Try to connect to database if packages are installed
+// Try to connect to database
 async function initDb() {
   try {
-    // Import the pg module
-    const pg = await import('pg').catch(e => {
-      console.error('Failed to import pg module:', e.message);
-      return null;
-    });
+    const pg = await import('pg').catch(() => null);
+    if (!pg) return null;
     
-    if (!pg) {
-      throw new Error('pg module not available. Try running: npm install pg');
-    }
+    const Pool = pg.Pool || (pg.default && pg.default.Pool);
+    if (!Pool) return null;
     
-    // Log the structure of the pg module to understand its shape
-    console.log('pg module structure:', Object.keys(pg));
-    
-    // The Pool constructor might be in different locations depending on how the module is structured
-    let Pool;
-    if (pg.Pool) {
-      Pool = pg.Pool;
-    } else if (pg.default && pg.default.Pool) {
-      Pool = pg.default.Pool;
-    } else {
-      console.error('pg module content:', pg);
-      throw new Error('Could not locate Pool constructor in pg module. Make sure pg is installed: npm install pg');
-    }
-    
-    console.log('Creating PostgreSQL connection pool...');
     const pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
+      connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/mydb',
     });
     
-    // Test the connection
-    console.log('Testing database connection...');
     await pool.query('SELECT NOW()');
     console.log('Database connection successful');
     
     db = pool;
-    useDbConnection = true;
+    dbConnected = true;
     return pool;
   } catch (err) {
-    console.log('Database connection failed or pg not installed. Using mock data instead.');
-    console.error('Error details:', err);
-    useDbConnection = false;
+    console.log('Database connection failed:', err.message);
+    dbConnected = false;
     return null;
   }
 }
@@ -75,219 +52,46 @@ async function createServer() {
   // Try to initialize database
   await initDb();
 
-  // API endpoints for data
+  // API endpoints
   const apiRouter = express.Router();
   
-  // Get all users
-  apiRouter.get('/users', async (req, res) => {
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM users');
-        res.json(result.rows);
-      } catch (err) {
-        console.error('Error querying users:', err);
-        res.json(mockData.users); // Fallback to mock data
-      }
+  // Status endpoint to report DB connection
+  apiRouter.get('/status', (req, res) => {
+    res.json({
+      dbConnected,
+      serverTime: new Date().toISOString()
+    });
+  });
+  
+  // Simple API routes that just report connection status
+  apiRouter.get('/users', (req, res) => {
+    if (dbConnected && db) {
+      db.query('SELECT * FROM users')
+        .then(result => res.json(result.rows))
+        .catch(err => res.status(500).json({ 
+          error: 'Database error', 
+          message: err.message 
+        }));
     } else {
-      res.json(mockData.users);
+      res.status(503).json({ message: 'Database not connected' });
     }
   });
   
-  // Get user by ID
-  apiRouter.get('/users/:id', async (req, res) => {
-    const id = parseInt(req.params.id);
+  apiRouter.get('/users/:id', (req, res) => {
+    if (!dbConnected || !db) {
+      return res.status(503).json({ message: 'Database not connected' });
+    }
     
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM users WHERE id = $1', [id]);
+    const id = parseInt(req.params.id);
+    db.query('SELECT * FROM users WHERE id = $1', [id])
+      .then(result => {
         if (result.rows.length) {
           res.json(result.rows[0]);
-        } else {
-          // User not found in DB, try mock data
-          const user = mockData.users.find(u => u.id === id);
-          if (user) {
-            res.json(user);
-          } else {
-            res.status(404).json({ message: 'User not found' });
-          }
-        }
-      } catch (err) {
-        console.error('Error querying user:', err);
-        // Fallback to mock data
-        const user = mockData.users.find(u => u.id === id);
-        if (user) {
-          res.json(user);
         } else {
           res.status(404).json({ message: 'User not found' });
         }
-      }
-    } else {
-      const user = mockData.users.find(u => u.id === id);
-      if (user) {
-        res.json(user);
-      } else {
-        res.status(404).json({ message: 'User not found' });
-      }
-    }
-  });
-  
-  // Get all products
-  apiRouter.get('/products', async (req, res) => {
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM products');
-        res.json(result.rows);
-      } catch (err) {
-        console.error('Error querying products:', err);
-        res.json(mockData.products); // Fallback to mock data
-      }
-    } else {
-      res.json(mockData.products);
-    }
-  });
-  
-  // Get product by ID
-  apiRouter.get('/products/:id', async (req, res) => {
-    const id = parseInt(req.params.id);
-    
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM products WHERE id = $1', [id]);
-        if (result.rows.length) {
-          res.json(result.rows[0]);
-        } else {
-          // Product not found in DB, try mock data
-          const product = mockData.products.find(p => p.id === id);
-          if (product) {
-            res.json(product);
-          } else {
-            res.status(404).json({ message: 'Product not found' });
-          }
-        }
-      } catch (err) {
-        console.error('Error querying product:', err);
-        // Fallback to mock data
-        const product = mockData.products.find(p => p.id === id);
-        if (product) {
-          res.json(product);
-        } else {
-          res.status(404).json({ message: 'Product not found' });
-        }
-      }
-    } else {
-      const product = mockData.products.find(p => p.id === id);
-      if (product) {
-        res.json(product);
-      } else {
-        res.status(404).json({ message: 'Product not found' });
-      }
-    }
-  });
-  
-  // Get all tasks
-  apiRouter.get('/tasks', async (req, res) => {
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM tasks');
-        res.json(result.rows);
-      } catch (err) {
-        console.error('Error querying tasks:', err);
-        res.json(mockData.tasks); // Fallback to mock data
-      }
-    } else {
-      res.json(mockData.tasks);
-    }
-  });
-  
-  // Get task by ID
-  apiRouter.get('/tasks/:id', async (req, res) => {
-    const id = parseInt(req.params.id);
-    
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM tasks WHERE id = $1', [id]);
-        if (result.rows.length) {
-          res.json(result.rows[0]);
-        } else {
-          // Task not found in DB, try mock data
-          const task = mockData.tasks.find(t => t.id === id);
-          if (task) {
-            res.json(task);
-          } else {
-            res.status(404).json({ message: 'Task not found' });
-          }
-        }
-      } catch (err) {
-        console.error('Error querying task:', err);
-        // Fallback to mock data
-        const task = mockData.tasks.find(t => t.id === id);
-        if (task) {
-          res.json(task);
-        } else {
-          res.status(404).json({ message: 'Task not found' });
-        }
-      }
-    } else {
-      const task = mockData.tasks.find(t => t.id === id);
-      if (task) {
-        res.json(task);
-      } else {
-        res.status(404).json({ message: 'Task not found' });
-      }
-    }
-  });
-  
-  // Get all posts
-  apiRouter.get('/posts', async (req, res) => {
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM posts');
-        res.json(result.rows);
-      } catch (err) {
-        console.error('Error querying posts:', err);
-        res.json(mockData.posts); // Fallback to mock data
-      }
-    } else {
-      res.json(mockData.posts);
-    }
-  });
-  
-  // Get post by ID
-  apiRouter.get('/posts/:id', async (req, res) => {
-    const id = parseInt(req.params.id);
-    
-    if (useDbConnection && db) {
-      try {
-        const result = await db.query('SELECT * FROM posts WHERE id = $1', [id]);
-        if (result.rows.length) {
-          res.json(result.rows[0]);
-        } else {
-          // Post not found in DB, try mock data
-          const post = mockData.posts.find(p => p.id === id);
-          if (post) {
-            res.json(post);
-          } else {
-            res.status(404).json({ message: 'Post not found' });
-          }
-        }
-      } catch (err) {
-        console.error('Error querying post:', err);
-        // Fallback to mock data
-        const post = mockData.posts.find(p => p.id === id);
-        if (post) {
-          res.json(post);
-        } else {
-          res.status(404).json({ message: 'Post not found' });
-        }
-      }
-    } else {
-      const post = mockData.posts.find(p => p.id === id);
-      if (post) {
-        res.json(post);
-      } else {
-        res.status(404).json({ message: 'Post not found' });
-      }
-    }
+      })
+      .catch(err => res.status(500).json({ error: 'Database error', message: err.message }));
   });
   
   // Register the API router
@@ -332,7 +136,7 @@ async function createServer() {
 
   app.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
-    console.log(`API endpoints available at http://localhost:${port}/api`);
+    console.log(`Database ${dbConnected ? 'connected' : 'not connected'}`);
   });
 }
 
