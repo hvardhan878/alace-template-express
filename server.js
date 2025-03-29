@@ -7,16 +7,153 @@ import sirv from 'sirv';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 
-// Load environment variables
-dotenv.config();
+// Function to find the .env file in various possible locations
+function findEnvFile() {
+  const possiblePaths = [
+    '.env',                      // Current directory
+    '../.env',                   // One level up
+  ];
+  
+  for (const envPath of possiblePaths) {
+    if (fs.existsSync(envPath)) {
+      console.log(`Found .env file at: ${envPath}`);
+      return envPath;
+    }
+  }
+  
+  console.warn('No .env file found in any of the expected locations');
+  return '.env'; // Default fallback
+}
+
+// Load environment variables with the correct path
+dotenv.config({ path: findEnvFile() });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const isProduction = process.env.NODE_ENV === 'production';
-const port = process.env.PORT || 3000;
+let isProduction = process.env.NODE_ENV === 'production';
+let port = process.env.PORT || 3002;
 
 // Initialize database connection
 let db = null;
 let dbConnected = false;
+let server = null;
+let currentDatabaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/mydb';
+
+// Function to reload environment variables
+function reloadEnv() {
+  const oldPort = port;
+  const oldNodeEnv = process.env.NODE_ENV;
+  const oldDatabaseUrl = currentDatabaseUrl;
+  
+  console.log('Reloading environment variables...');
+  
+  // Read env file directly to ensure we get fresh values
+  try {
+    const envConfig = dotenv.config({ override: true, path: findEnvFile() });
+    console.log('Environment variables reloaded:', envConfig.parsed ? Object.keys(envConfig.parsed).length : 0, 'variables loaded');
+  } catch (err) {
+    console.error('Error reloading environment variables:', err.message);
+  }
+  
+  // Update local variables that depend on env vars
+  isProduction = process.env.NODE_ENV === 'production';
+  port = process.env.PORT || 3002;
+  const newDatabaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/mydb';
+  
+  console.log('Environment variables comparison:');
+  console.log(`- Port: ${oldPort} -> ${port}`);
+  console.log(`- Node env: ${oldNodeEnv} -> ${process.env.NODE_ENV}`);
+  console.log(`- Database URL changed: ${oldDatabaseUrl !== newDatabaseUrl}`);
+  
+  currentDatabaseUrl = newDatabaseUrl;
+  
+  // Check if critical server settings changed
+  const serverSettingsChanged = 
+    oldPort !== port || 
+    oldNodeEnv !== process.env.NODE_ENV;
+  
+  // Check if database connection settings changed
+  const dbSettingsChanged = oldDatabaseUrl !== currentDatabaseUrl;
+  
+  // If database connection string changed, force reconnection
+  if (dbSettingsChanged) {
+    console.log('Database connection string changed, reconnecting...');
+    
+    // Force database disconnect - use async/await with try/catch for clarity
+    (async () => {
+      if (db) {
+        console.log('Closing existing database connection...');
+        try {
+          await db.end();
+          console.log('Database connection closed successfully');
+        } catch (err) {
+          console.error('Error closing database connection:', err.message);
+        }
+        
+        // Reset database state
+        db = null;
+        dbConnected = false;
+        
+        // Explicitly reconnect after disconnection is complete
+        console.log('Initializing new database connection...');
+        await initDb();
+      } else {
+        console.log('No existing database connection, connecting with new settings...');
+        await initDb();
+      }
+    })();
+  }
+  
+  // If critical settings changed, restart the server
+  if (serverSettingsChanged && server) {
+    console.log('Critical server settings changed, restarting server...');
+    restartServer();
+  }
+  
+  return process.env;
+}
+
+// Watch for changes in .env file - check multiple possible locations
+const envFile = findEnvFile();
+if (fs.existsSync(envFile)) {
+  console.log(`Setting up file watcher for .env at: ${envFile}`);
+  
+  // More robust file watching
+  let fsWait = false;
+  try {
+    fs.watch(envFile, { persistent: true }, (eventType, filename) => {
+      if (eventType === 'change' && filename) {
+        // Debounce
+        if (fsWait) return;
+        fsWait = setTimeout(() => { fsWait = false; }, 100);
+        
+        console.log(`.env file changed (${filename}), reloading environment variables`);
+        reloadEnv();
+      }
+    });
+    console.log(`Successfully watching .env file for changes at: ${envFile}`);
+  } catch (err) {
+    console.error(`Error setting up file watcher: ${err.message}`);
+    
+    // Fallback to interval-based checking for environments where fs.watch doesn't work well
+    console.log('Setting up fallback interval-based file checking');
+    let lastMtime = fs.statSync(envFile).mtime.getTime();
+    
+    setInterval(() => {
+      try {
+        const currentMtime = fs.statSync(envFile).mtime.getTime();
+        if (currentMtime > lastMtime) {
+          console.log('.env file changed (detected by polling), reloading environment variables');
+          lastMtime = currentMtime;
+          reloadEnv();
+        }
+      } catch (err) {
+        console.error(`Error checking file: ${err.message}`);
+      }
+    }, 1000);
+  }
+} else {
+  console.warn(`Warning: .env file not found for watching at ${envFile}`);
+}
 
 // Try to connect to database
 async function initDb() {
@@ -27,8 +164,26 @@ async function initDb() {
     const Pool = pg.Pool || (pg.default && pg.default.Pool);
     if (!Pool) return null;
     
+    // Close previous connection if exists
+    if (db) {
+      try {
+        await db.end();
+        console.log('Closed previous database connection');
+      } catch (err) {
+        console.error('Error closing previous database connection:', err.message);
+      }
+      
+      // Reset connection status
+      db = null;
+      dbConnected = false;
+    }
+    
+    console.log(`Connecting to database with URL: ${currentDatabaseUrl.substring(0, currentDatabaseUrl.indexOf('@') > 0 ? currentDatabaseUrl.indexOf('@') : 10)}...`);
+    
     const pool = new Pool({
-      connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/mydb',
+      connectionString: currentDatabaseUrl,
+      // Add a short connection timeout to fail fast if the connection can't be established
+      connectionTimeoutMillis: 5000
     });
     
     await pool.query('SELECT NOW()');
@@ -59,7 +214,24 @@ async function createServer() {
   apiRouter.get('/status', (req, res) => {
     res.json({
       dbConnected,
-      serverTime: new Date().toISOString()
+      serverTime: new Date().toISOString(),
+      port: port,
+      nodeEnv: process.env.NODE_ENV
+    });
+  });
+  
+  // Endpoint to reload environment variables
+  apiRouter.post('/reload-env', (req, res) => {
+    const env = reloadEnv();
+    res.json({ 
+      success: true, 
+      message: 'Environment variables reloaded',
+      // Return non-sensitive environment variables
+      port: env.PORT,
+      nodeEnv: env.NODE_ENV,
+      dbConnected,
+      databaseUrlChanged: process.env.DATABASE_URL !== currentDatabaseUrl,
+      serverRestarting: port !== (req.socket.localPort || req.connection.localPort)
     });
   });
   
@@ -134,10 +306,17 @@ async function createServer() {
     }
   });
 
-  app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-    console.log(`Database ${dbConnected ? 'connected' : 'not connected'}`);
+  // Start the server
+  return new Promise((resolve) => {
+    const newServer = app.listen(port, () => {
+      console.log(`Server running at http://localhost:${port}`);
+      console.log(`Database ${dbConnected ? 'connected' : 'not connected'}`);
+      resolve(newServer);
+    });
   });
 }
 
-createServer();
+// Start the server initially
+createServer().then(newServer => {
+  server = newServer;
+});
